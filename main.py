@@ -33,8 +33,8 @@ os.makedirs("static", exist_ok=True)
 
 # Ruta raíz
 @app.get("/")
-def read_root():
-    return {"message": "API de Productos funcionando correctamente"}
+def home():
+    return {"message": "API funcionando"}
 
 # Obtener todos los productos
 @app.get("/productos")
