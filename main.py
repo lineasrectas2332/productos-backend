@@ -89,25 +89,32 @@ async def add_producto(
         raise HTTPException(status_code=500, detail=f"Error al agregar producto: {str(e)}")
 
 @app.put("/productos/{producto_id}")
-def update_producto(
+async def update_producto(
     producto_id: str,
-    nombre: str = Form(...),
-    descripcion: str = Form(...),
-    precio: float = Form(...),
-    categoria: str = Form(...),
-    imagen: UploadFile = File(None)  # Hacer la imagen opcional en updates
+    nombre: str = Form(None),
+    descripcion: str = Form(None),
+    precio: float = Form(None),
+    categoria: str = Form(None),
+    imagen: UploadFile = File(None)
 ):
     try:
         producto_existente = next((p for p in productos if p.id == producto_id), None)
         if not producto_existente:
             raise HTTPException(status_code=404, detail="Producto no encontrado")
 
+        # Mantener valores anteriores si no se proporcionan nuevos
+        nombre = nombre if nombre is not None else producto_existente.nombre
+        descripcion = descripcion if descripcion is not None else producto_existente.descripcion
+        precio = precio if precio is not None else producto_existente.precio
+        categoria = categoria if categoria is not None else producto_existente.categoria
+        
         # Manejo de imagen
         imagen_url = producto_existente.imagen
         if imagen and imagen.filename:
             # Eliminar imagen anterior si existe
-            if os.path.exists(producto_existente.imagen.replace("/static/", "static/")):
-                os.remove(producto_existente.imagen.replace("/static/", "static/"))
+            imagen_path = producto_existente.imagen.replace("/static/", "static/")
+            if os.path.exists(imagen_path):
+                os.remove(imagen_path)
             
             # Guardar nueva imagen
             file_extension = os.path.splitext(imagen.filename)[1]
@@ -131,7 +138,7 @@ def update_producto(
         return producto_actualizado
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error al actualizar producto: {str(e)}")
 
 @app.delete("/productos/{producto_id}")
 def delete_producto(producto_id: str):
