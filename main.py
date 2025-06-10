@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.redis import RedisBackend
+from fastapi_cache.decorator import cache
 from pydantic import BaseModel
 from typing import List, Optional
 import shutil
@@ -8,6 +11,9 @@ import uuid
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from PIL import Image  # Para optimización de imágenes
+import io
+from redis import asyncio as aioredis
 
 app = FastAPI()
 
@@ -20,17 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Base de datos
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:clave@host:puerto/db")
-
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# Configuración Redis para caché (usar Redis gratis en Render o Upstash)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 @app.on_event("startup")
-def startup():
+async def startup():
+    # Configurar caché Redis
+    redis = aioredis.from_url(REDIS_URL)
+    FastAPICache.init(RedisBackend(redis), prefix="fastapi-cache")
+    
+    # Configurar índices en la base de datos
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS productos (
                 id VARCHAR(36) PRIMARY KEY,
@@ -42,6 +50,9 @@ def startup():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Crear índices para mejorar consultas
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_productos_created_at ON productos(created_at)")
         conn.commit()
     except Exception as e:
         print("Error al iniciar:", e)
@@ -49,36 +60,61 @@ def startup():
         cur.close()
         conn.close()
 
-# Archivos estáticos
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Conexión a la base de datos con pool de conexiones
+from psycopg2.pool import SimpleConnectionPool
 
-# Modelo
-class Producto(BaseModel):
-    id: str
-    nombre: str
-    descripcion: str
-    precio: float
-    imagen: str
-    categoria: str
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:clave@host:puerto/db")
+connection_pool = SimpleConnectionPool(
+    minconn=1,
+    maxconn=10,
+    dsn=DATABASE_URL,
+    cursor_factory=RealDictCursor
+)
 
-@app.get("/")
-def home():
-    return {"message": "API funcionando"}
+def get_db_connection():
+    return connection_pool.getconn()
 
+def release_db_connection(conn):
+    connection_pool.putconn(conn)
+
+# Optimizar imágenes antes de guardar
+async def optimize_image(file: UploadFile):
+    # Leer imagen original
+    image = Image.open(io.BytesIO(await file.read()))
+    
+    # Convertir a modo RGB si es RGBA
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+    
+    # Redimensionar si es muy grande (máx 1200px en el lado más largo)
+    max_size = 1200
+    if max(image.size) > max_size:
+        ratio = max_size / max(image.size)
+        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # Optimizar calidad (80%)
+    output = io.BytesIO()
+    image.save(output, format='JPEG', quality=80, optimize=True)
+    output.seek(0)
+    
+    return output
+
+# Endpoints con caché
 @app.get("/productos")
+@cache(expire=30)  # Cachear por 30 segundos
 def get_productos(categoria: Optional[str] = None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         if categoria:
-            cur.execute("SELECT * FROM productos WHERE LOWER(categoria) = LOWER(%s)", (categoria,))
+            cur.execute("SELECT * FROM productos WHERE LOWER(categoria) = LOWER(%s) ORDER BY created_at DESC", (categoria,))
         else:
-            cur.execute("SELECT * FROM productos")
+            cur.execute("SELECT * FROM productos ORDER BY created_at DESC")
         return cur.fetchall()
     finally:
         cur.close()
-        conn.close()
+        release_db_connection(conn)
 
 @app.post("/productos")
 async def add_producto(
@@ -96,19 +132,26 @@ async def add_producto(
     if ext not in ['.jpg', '.jpeg', '.png', '.webp']:
         raise HTTPException(status_code=400, detail="Formato de imagen no soportado")
 
-    ruta_imagen = f"static/{id_producto}{ext}"
+    # Optimizar imagen antes de guardar
+    optimized_image = await optimize_image(imagen)
+    ruta_imagen = f"static/{id_producto}.jpg"  # Siempre guardamos como JPG optimizado
+    
     with open(ruta_imagen, "wb") as buffer:
-        shutil.copyfileobj(imagen.file, buffer)
+        buffer.write(optimized_image.getvalue())
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             "INSERT INTO productos (id, nombre, descripcion, precio, imagen, categoria) VALUES (%s, %s, %s, %s, %s, %s)",
-            (id_producto, nombre, descripcion, precio, f"/static/{id_producto}{ext}", categoria.lower())
+            (id_producto, nombre, descripcion, precio, f"/static/{id_producto}.jpg", categoria.lower())
         )
         conn.commit()
+        
+        # Invalidar caché después de agregar nuevo producto
+        await FastAPICache.clear(namespace="productos")
+        
         return {"mensaje": "Producto creado"}
     finally:
         cur.close()
-        conn.close()
+        release_db_connection(conn)
